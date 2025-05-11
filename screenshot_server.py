@@ -97,6 +97,10 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
         logger.error(f"خطا در پردازش تصویر: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
+@app.get("/ping")
+async def ping(api_key: str = Security(verify_api_key)):
+    return {"status": "alive"}
+
 @app.post("/screenshot", response_model=dict)
 async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(verify_api_key)):
     try:
