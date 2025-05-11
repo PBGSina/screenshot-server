@@ -29,6 +29,7 @@ class ScreenshotRequest(BaseModel):
 
 async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     output_path = f"/tmp/{symbol}_screenshot.png"
+    debug_path = f"/tmp/{symbol}_debug_screenshot.png"
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
     
     max_retries = 3
@@ -37,18 +38,27 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
-                await page.goto(chart_url, timeout=60000)  # افزایش Timeout به 60 ثانیه
-                await page.wait_for_selector(".tv-chart-container", timeout=60000)
-                await asyncio.sleep(2)  # صبر اضافی برای لود کامل
+                await page.goto(chart_url, timeout=90000, wait_until="domcontentloaded")  # Timeout 90 ثانیه
+                await asyncio.sleep(5)  # صبر اضافی برای لود جاوااسکریپت
                 await page.screenshot(path=output_path, full_page=True)
                 await browser.close()
             logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
             return output_path
         except Exception as e:
             logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    page = await browser.new_page()
+                    await page.goto(chart_url, timeout=30000)
+                    await page.screenshot(path=debug_path, full_page=True)
+                    logger.info(f"اسکرین‌شات دیباگ ذخیره شد: {debug_path}")
+                    await browser.close()
+            except Exception as debug_e:
+                logger.error(f"خطا در گرفتن اسکرین‌شات دیباگ: {str(debug_e)}")
             if attempt == max_retries - 1:
                 raise HTTPException(status_code=500, detail=f"Failed to take screenshot after {max_retries} attempts: {str(e)}")
-            await asyncio.sleep(5)  # صبر بین تلاش‌ها
+            await asyncio.sleep(5)
 
 def add_arrow_to_image(image_path: str, signal_type: str) -> str:
     try:
