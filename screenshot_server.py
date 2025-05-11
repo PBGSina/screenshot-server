@@ -8,13 +8,26 @@ import logging
 from datetime import datetime
 import asyncio
 
-logging.basicConfig(level=logging.INFO)
+# تنظیمات لاگ
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
 API_KEY = os.getenv("API_TOKEN", "your-secret-api-key")
 api_key_header = APIKeyHeader(name="X-API-Key")
+
+# ثابت برای فاصله زمانی لاگ
+LOG_INTERVAL = 300  # هر 5 دقیقه
+
+async def log_periodically():
+    """تسک پس‌زمینه برای ثبت لاگ هر 5 دقیقه"""
+    while True:
+        logger.info(f"سرور اسکرین‌شات در حال اجرا است - {datetime.utcnow()}")
+        await asyncio.sleep(LOG_INTERVAL)
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -116,3 +129,8 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
         return {"image": image_data.hex()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.on_event("startup")
+async def startup_event():
+    """شروع تسک لاگ دوره‌ای هنگام راه‌اندازی سرور"""
+    asyncio.create_task(log_periodically())
