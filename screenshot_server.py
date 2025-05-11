@@ -38,11 +38,13 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 page = await browser.new_page()
-                await page.goto(chart_url, timeout=90000, wait_until="domcontentloaded")  # Timeout 90 ثانیه
-                await asyncio.sleep(5)  # صبر اضافی برای لود جاوااسکریپت
-                await page.screenshot(path=output_path, full_page=True)
+                logger.info(f"Navigating to {chart_url}")
+                await page.goto(chart_url, timeout=90000, wait_until="domcontentloaded")
+                logger.info(f"Page loaded for {symbol}")
+                await asyncio.sleep(5)
+                await page.screenshot(path=output_path, full_page=True, timeout=60000)
+                logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
                 await browser.close()
-            logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
             return output_path
         except Exception as e:
             logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
