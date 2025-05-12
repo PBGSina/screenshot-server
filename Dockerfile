@@ -1,7 +1,7 @@
 FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
-# نصب وابستگی‌های سیستمی اضافی
-RUN apt-get update && apt-get install -y \
+# به‌روزرسانی مخازن و نصب وابستگی‌های سیستمی
+RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
     libatk1.0-0 \
     libatk-bridge2.0-0 \
@@ -17,7 +17,8 @@ RUN apt-get update && apt-get install -y \
     libcairo2 \
     libasound2 \
     fonts-liberation \
-    ttf-freefont \
+    fonts-freefont-ttf \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
