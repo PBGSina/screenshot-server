@@ -21,7 +21,10 @@ API_KEY = os.getenv("API_TOKEN", "your-secret-api-key")
 api_key_header = APIKeyHeader(name="X-API-Key")
 
 # لیست صرافی‌های پشتیبانی‌شده در TradingView
-SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN', 'GATEIO'}  # اضافه کردن GATEIO
+SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN', 'GATEIO'}
+
+# محدود کردن تعداد مرورگرهای هم‌زمان
+semaphore = asyncio.Semaphore(2)
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -46,31 +49,33 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     for attempt in range(max_retries):
         browser = None
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-                )
-                page = await browser.new_page()
-                logger.info(f"Navigating to {chart_url} for {symbol} (Attempt {attempt + 1})")
-                await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")
-                logger.info(f"Page loaded for {symbol}")
-                await asyncio.sleep(5)  # صبر برای رندر کامل چارت
-                await page.screenshot(path=output_path, full_page=True, timeout=90000)
-                logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
-                return output_path
-        except Exception as e:
-            logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
-            try:
+            async with semaphore:  # محدود کردن تعداد مرورگرهای هم‌زمان
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(
                         headless=True,
                         args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
                     )
                     page = await browser.new_page()
-                    await page.goto(chart_url, timeout=30000)
-                    await page.screenshot(path=debug_path, full_page=True, timeout=30000)
-                    logger.info(f"اسکرین‌شات دیباگ ذخیره شد: {debug_path}")
+                    logger.info(f"Navigating to {chart_url} for {symbol} (Attempt {attempt + 1})")
+                    await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")
+                    logger.info(f"Page loaded for {symbol}")
+                    await asyncio.sleep(5)  # صبر برای رندر کامل چارت
+                    await page.screenshot(path=output_path, full_page=True, timeout=90000)
+                    logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
+                    return output_path
+        except Exception as e:
+            logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
+            try:
+                async with semaphore:
+                    async with async_playwright() as p:
+                        browser = await p.chromium.launch(
+                            headless=True,
+                            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                        )
+                        page = await browser.new_page()
+                        await page.goto(chart_url, timeout=30000, wait_until="domcontentloaded")
+                        await page.screenshot(path=debug_path, full_page=True, timeout=30000)
+                        logger.info(f"اسکرین‌شات دیباگ ذخیره شد: {debug_path}")
             except Exception as debug_e:
                 logger.error(f"خطا در گرفتن اسکرین‌شات دیباگ برای {symbol}: {str(debug_e)}")
             if attempt == max_retries - 1:
@@ -90,10 +95,10 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
         draw = ImageDraw.Draw(img)
         
         try:
-            font = ImageFont.truetype("arial.ttf", 40)
+            font = ImageFont.truetype("LiberationSans-Regular.ttf", 40)
         except:
             font = ImageFont.load_default()
-            logger.warning("فونت arial.ttf یافت نشد، استفاده از فونت پیش‌فرض")
+            logger.warning("فونت LiberationSans-Regular.ttf یافت نشد، استفاده از فونت پیش‌فرض")
         
         signal_text = "BUY" if signal_type == "خرید" else "SELL"
         text_width = draw.textlength(signal_text, font=font)
@@ -141,8 +146,11 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
         with open(image_path, "rb") as f:
             image_data = f.read()
         
-        os.unlink(image_path)
-        logger.info(f"فایل اسکرین‌شات {image_path} حذف شد")
+        try:
+            os.unlink(image_path)
+            logger.info(f"فایل اسکرین‌شات {image_path} حذف شد")
+        except Exception as e:
+            logger.warning(f"خطا در حذف فایل اسکرین‌شات {image_path}: {str(e)}")
         
         return {"image": image_data.hex()}
     except Exception as e:
