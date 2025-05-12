@@ -20,6 +20,9 @@ app = FastAPI()
 API_KEY = os.getenv("API_TOKEN", "your-secret-api-key")
 api_key_header = APIKeyHeader(name="X-API-Key")
 
+# لیست صرافی‌های پشتیبانی‌شده در TradingView
+SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN'}  # می‌تونی صرافی‌های دیگه رو اضافه کنی
+
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
@@ -32,6 +35,9 @@ class ScreenshotRequest(BaseModel):
     exchange: str = "BINANCE"
 
 async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
+    if exchange.upper() not in SUPPORTED_EXCHANGES:
+        raise HTTPException(status_code=400, detail=f"صرافی {exchange} پشتیبانی نمی‌شود. صرافی‌های موجود: {', '.join(SUPPORTED_EXCHANGES)}")
+    
     output_path = f"/tmp/{symbol}_screenshot.png"
     debug_path = f"/tmp/{symbol}_debug_screenshot.png"
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
