@@ -1,5 +1,8 @@
 FROM mcr.microsoft.com/playwright/python:v1.47.0-jammy
 
+# فعال‌سازی فضای swap برای مدیریت بهتر حافظه
+RUN fallocate -l 512M /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+
 # به‌روزرسانی مخازن و نصب وابستگی‌های سیستمی
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libnss3 \
