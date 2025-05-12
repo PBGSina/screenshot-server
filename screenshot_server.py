@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 import asyncio
 import psutil
+import sys
 
 # تنظیمات لاگ
 logging.basicConfig(
@@ -27,6 +28,10 @@ SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN', 'GATEIO'}
 # محدود کردن تعداد مرورگرهای هم‌زمان به 1
 semaphore = asyncio.Semaphore(1)
 
+# شمارش خطاهای متوالی
+consecutive_errors = 0
+MAX_CONSECUTIVE_ERRORS = 2  # حداکثر تعداد خطاهای متوالی قبل از ری‌استارت
+
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
@@ -38,7 +43,23 @@ class ScreenshotRequest(BaseModel):
     interval: str = "5"
     exchange: str = "BINANCE"
 
+async def close_playwright_resources(context=None, browser=None):
+    """بستن ایمن منابع Playwright"""
+    if context:
+        try:
+            await context.close()
+            logger.info("Context بسته شد")
+        except Exception as e:
+            logger.error(f"خطا در بستن context: {str(e)}")
+    if browser:
+        try:
+            await browser.close()
+            logger.info("مرورگر بسته شد")
+        except Exception as e:
+            logger.error(f"خطا در بستن مرورگر: {str(e)}")
+
 async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
+    global consecutive_errors
     if exchange.upper() not in SUPPORTED_EXCHANGES:
         raise HTTPException(status_code=400, detail=f"صرافی {exchange} پشتیبانی نمی‌شود. صرافی‌های موجود: {', '.join(SUPPORTED_EXCHANGES)}")
     
@@ -52,11 +73,11 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
         context = None
         try:
             async with semaphore:  # محدود کردن تعداد مرورگرهای هم‌زمان
+                # لاگ وضعیت حافظه قبل از اجرای مرورگر
+                memory_info = psutil.virtual_memory()
+                logger.info(f"Memory usage before launching browser for {symbol}: {memory_info.percent}% (Available: {memory_info.available / 1024 / 1024:.2f} MB)")
+                
                 async with async_playwright() as p:
-                    # لاگ وضعیت حافظه قبل از اجرای مرورگر
-                    memory_info = psutil.virtual_memory()
-                    logger.info(f"Memory usage before launching browser for {symbol}: {memory_info.percent}% (Available: {memory_info.available / 1024 / 1024:.2f} MB)")
-                    
                     browser = await p.chromium.launch(
                         headless=True,
                         args=[
@@ -76,15 +97,21 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                     page = await context.new_page()
                     
                     logger.info(f"Navigating to {chart_url} for {symbol} (Attempt {attempt + 1})")
-                    await page.goto(chart_url, timeout=60000, wait_until="domcontentloaded")
+                    await page.goto(chart_url, timeout=90000, wait_until="domcontentloaded")
                     logger.info(f"Page loaded for {symbol}")
                     await asyncio.sleep(5)  # صبر برای رندر کامل چارت
                     
-                    await page.screenshot(path=output_path, full_page=True, timeout=90000)
+                    await page.screenshot(path=output_path, full_page=True, timeout=120000)
                     logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
+                    consecutive_errors = 0  # ریست شمارش خطاها
                     return output_path
         except Exception as e:
             logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
+            consecutive_errors += 1
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
+                sys.exit(1)  # خروج برای ری‌استارت توسط Render
+            
             try:
                 async with semaphore:
                     async with async_playwright() as p:
@@ -103,7 +130,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                             no_viewport=True
                         )
                         page = await context.new_page()
-                        await page.goto(chart_url, timeout=60000, wait_until="domcontentloaded")
+                        await page.goto(chart_url, timeout=90000, wait_until="domcontentloaded")
                         await page.screenshot(path=debug_path, full_page=True, timeout=30000)
                         logger.info(f"اسکرین‌شات دیباگ ذخیره شد: {debug_path}")
             except Exception as debug_e:
@@ -112,18 +139,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                 raise HTTPException(status_code=500, detail=f"Failed to take screenshot for {symbol} after {max_retries} attempts: {str(e)}")
             await asyncio.sleep(5)
         finally:
-            if context:
-                try:
-                    await context.close()
-                    logger.info(f"Context برای {symbol} بسته شد")
-                except Exception as e:
-                    logger.error(f"خطا در بستن context برای {symbol}: {str(e)}")
-            if browser:
-                try:
-                    await browser.close()
-                    logger.info(f"مرورگر برای {symbol} بسته شد")
-                except Exception as e:
-                    logger.error(f"خطا در بستن مرورگر برای {symbol}: {str(e)}")
+            await close_playwright_resources(context, browser)
 
 def add_arrow_to_image(image_path: str, signal_type: str) -> str:
     try:
