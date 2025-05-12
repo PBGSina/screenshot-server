@@ -1,12 +1,13 @@
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Playwright
 from PIL import Image, ImageDraw, ImageFont
 import os
 import logging
 from datetime import datetime
 import asyncio
+import psutil
 
 # تنظیمات لاگ
 logging.basicConfig(
@@ -23,8 +24,8 @@ api_key_header = APIKeyHeader(name="X-API-Key")
 # لیست صرافی‌های پشتیبانی‌شده در TradingView
 SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN', 'GATEIO'}
 
-# محدود کردن تعداد مرورگرهای هم‌زمان
-semaphore = asyncio.Semaphore(2)
+# محدود کردن تعداد مرورگرهای هم‌زمان به 1
+semaphore = asyncio.Semaphore(1)
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -48,18 +49,37 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     max_retries = 3
     for attempt in range(max_retries):
         browser = None
+        context = None
         try:
             async with semaphore:  # محدود کردن تعداد مرورگرهای هم‌زمان
                 async with async_playwright() as p:
+                    # لاگ وضعیت حافظه قبل از اجرای مرورگر
+                    memory_info = psutil.virtual_memory()
+                    logger.info(f"Memory usage before launching browser for {symbol}: {memory_info.percent}% (Available: {memory_info.available / 1024 / 1024:.2f} MB)")
+                    
                     browser = await p.chromium.launch(
                         headless=True,
-                        args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                        args=[
+                            '--no-sandbox',
+                            '--disable-setuid-sandbox',
+                            '--disable-dev-shm-usage',
+                            '--disable-gpu',
+                            '--single-process',  # کاهش مصرف حافظه
+                            '--disable-background-networking',
+                            '--disable-background-timer-throttling',
+                        ]
                     )
-                    page = await browser.new_page()
+                    context = await browser.new_context(
+                        viewport={'width': 1280, 'height': 720},
+                        no_viewport=True
+                    )
+                    page = await context.new_page()
+                    
                     logger.info(f"Navigating to {chart_url} for {symbol} (Attempt {attempt + 1})")
-                    await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")
+                    await page.goto(chart_url, timeout=60000, wait_until="domcontentloaded")
                     logger.info(f"Page loaded for {symbol}")
                     await asyncio.sleep(5)  # صبر برای رندر کامل چارت
+                    
                     await page.screenshot(path=output_path, full_page=True, timeout=90000)
                     logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
                     return output_path
@@ -70,10 +90,20 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                     async with async_playwright() as p:
                         browser = await p.chromium.launch(
                             headless=True,
-                            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                            args=[
+                                '--no-sandbox',
+                                '--disable-setuid-sandbox',
+                                '--disable-dev-shm-usage',
+                                '--disable-gpu',
+                                '--single-process',
+                            ]
                         )
-                        page = await browser.new_page()
-                        await page.goto(chart_url, timeout=30000, wait_until="domcontentloaded")
+                        context = await browser.new_context(
+                            viewport={'width': 1280, 'height': 720},
+                            no_viewport=True
+                        )
+                        page = await context.new_page()
+                        await page.goto(chart_url, timeout=60000, wait_until="domcontentloaded")
                         await page.screenshot(path=debug_path, full_page=True, timeout=30000)
                         logger.info(f"اسکرین‌شات دیباگ ذخیره شد: {debug_path}")
             except Exception as debug_e:
@@ -82,6 +112,12 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                 raise HTTPException(status_code=500, detail=f"Failed to take screenshot for {symbol} after {max_retries} attempts: {str(e)}")
             await asyncio.sleep(5)
         finally:
+            if context:
+                try:
+                    await context.close()
+                    logger.info(f"Context برای {symbol} بسته شد")
+                except Exception as e:
+                    logger.error(f"خطا در بستن context برای {symbol}: {str(e)}")
             if browser:
                 try:
                     await browser.close()
