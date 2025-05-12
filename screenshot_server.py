@@ -21,7 +21,7 @@ API_KEY = os.getenv("API_TOKEN", "your-secret-api-key")
 api_key_header = APIKeyHeader(name="X-API-Key")
 
 # لیست صرافی‌های پشتیبانی‌شده در TradingView
-SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN'}  # می‌تونی صرافی‌های دیگه رو اضافه کنی
+SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN', 'GATEIO'}  # اضافه کردن GATEIO
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -44,33 +44,45 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     
     max_retries = 3
     for attempt in range(max_retries):
+        browser = None
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                )
                 page = await browser.new_page()
-                logger.info(f"Navigating to {chart_url}")
-                await page.goto(chart_url, timeout=90000, wait_until="domcontentloaded")
+                logger.info(f"Navigating to {chart_url} for {symbol} (Attempt {attempt + 1})")
+                await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")
                 logger.info(f"Page loaded for {symbol}")
-                await asyncio.sleep(5)
-                await page.screenshot(path=output_path, full_page=True, timeout=60000)
+                await asyncio.sleep(5)  # صبر برای رندر کامل چارت
+                await page.screenshot(path=output_path, full_page=True, timeout=90000)
                 logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
-                await browser.close()
-            return output_path
+                return output_path
         except Exception as e:
             logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
             try:
                 async with async_playwright() as p:
-                    browser = await p.chromium.launch(headless=True)
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                    )
                     page = await browser.new_page()
                     await page.goto(chart_url, timeout=30000)
-                    await page.screenshot(path=debug_path, full_page=True)
+                    await page.screenshot(path=debug_path, full_page=True, timeout=30000)
                     logger.info(f"اسکرین‌شات دیباگ ذخیره شد: {debug_path}")
-                    await browser.close()
             except Exception as debug_e:
-                logger.error(f"خطا در گرفتن اسکرین‌شات دیباگ: {str(debug_e)}")
+                logger.error(f"خطا در گرفتن اسکرین‌شات دیباگ برای {symbol}: {str(debug_e)}")
             if attempt == max_retries - 1:
-                raise HTTPException(status_code=500, detail=f"Failed to take screenshot after {max_retries} attempts: {str(e)}")
+                raise HTTPException(status_code=500, detail=f"Failed to take screenshot for {symbol} after {max_retries} attempts: {str(e)}")
             await asyncio.sleep(5)
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                    logger.info(f"مرورگر برای {symbol} بسته شد")
+                except Exception as e:
+                    logger.error(f"خطا در بستن مرورگر برای {symbol}: {str(e)}")
 
 def add_arrow_to_image(image_path: str, signal_type: str) -> str:
     try:
@@ -81,6 +93,7 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
             font = ImageFont.truetype("arial.ttf", 40)
         except:
             font = ImageFont.load_default()
+            logger.warning("فونت arial.ttf یافت نشد، استفاده از فونت پیش‌فرض")
         
         signal_text = "BUY" if signal_type == "خرید" else "SELL"
         text_width = draw.textlength(signal_text, font=font)
@@ -102,6 +115,7 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
         draw.text((10, img.height - 30), current_time, fill='white', font=font)
         
         img.save(image_path)
+        logger.info(f"تصویر برای {signal_type} پردازش شد: {image_path}")
         return image_path
     except Exception as e:
         logger.error(f"خطا در پردازش تصویر: {str(e)}")
@@ -128,7 +142,9 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
             image_data = f.read()
         
         os.unlink(image_path)
+        logger.info(f"فایل اسکرین‌شات {image_path} حذف شد")
         
         return {"image": image_data.hex()}
     except Exception as e:
+        logger.error(f"خطا در پردازش درخواست اسکرین‌شات برای {request.symbol}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
