@@ -27,11 +27,11 @@ api_key_header = APIKeyHeader(name="X-API-Key")
 SUPPORTED_EXCHANGES = {'BINANCE', 'KUCOIN', 'BYBIT', 'KRAKEN', 'GATEIO'}
 
 # محدود کردن تعداد مرورگرهای هم‌زمان
-semaphore = asyncio.Semaphore(1)
+semaphore = asyncio.Semaphore(2)
 
 # شمارش خطاهای متوالی
 consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 2  # حداکثر خطاهای متوالی قبل از ری‌استارت
+MAX_CONSECUTIVE_ERRORS = 5  # حداکثر خطاهای متوالی قبل از ری‌استارت
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -52,14 +52,12 @@ async def close_playwright_resources(context=None, browser=None):
             logger.info("Context بسته شد")
         except Exception as e:
             logger.error(f"خطا در بستن context: {str(e)}")
-            raise
     if browser and not getattr(browser, '_closed', True):
         try:
             await browser.close()
             logger.info("مرورگر بسته شد")
         except Exception as e:
             logger.error(f"خطا در بستن مرورگر: {str(e)}")
-            raise
 
 async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     global consecutive_errors
@@ -71,20 +69,21 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
     
     max_retries = 3
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=[
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--single-process',
-                '--disable-background-networking',
-                '--disable-background-timer-throttling',
-            ]
-        )
-        try:
+    browser = None
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--single-process',
+                    '--disable-background-networking',
+                    '--disable-background-timer-throttling',
+                ]
+            )
             for attempt in range(max_retries):
                 context = None
                 try:
@@ -99,11 +98,11 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         page = await context.new_page()
                         
                         logger.info(f"رفتن به {chart_url} برای {symbol} (تلاش {attempt + 1})")
-                        await page.goto(chart_url, timeout=60000, wait_until="domcontentloaded")
+                        await page.goto(chart_url, timeout=60000, wait_until="networkidle")
                         logger.info(f"صفحه برای {symbol} بارگذاری شد")
                         
-                        # انتظار برای رندر کامل چارت
-                        await page.wait_for_selector('.chart-container', timeout=30000)
+                        # انتظار برای رندر کامل صفحه
+                        await page.wait_for_load_state("networkidle", timeout=60000)
                         
                         await page.screenshot(path=output_path, full_page=True, timeout=60000)
                         logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
@@ -116,45 +115,21 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
                         sys.exit(1)
                     
-                    try:
-                        async with semaphore:
-                            context = await browser.new_context(
-                                viewport={'width': 1280, 'height': 720},
-                                no_viewport=True
-                            )
-                            page = await context.new_page()
-                            await page.goto(chart_url, timeout=60000, wait_until="domcontentloaded")
-                            await page.screenshot(path=debug_path, full_page=True, timeout=30000)
-                            logger.info(f"اسکرین‌شات دیباگ ذخیره شد: {debug_path}")
-                    except Exception as debug_e:
-                        logger.error(f"خطا در گرفتن اسکرین‌شات دیباگ برای {symbol}: {str(debug_e)}")
-                        consecutive_errors += 1
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
-                            sys.exit(1)
-                    if attempt == max_retries - 1:
-                        raise HTTPException(status_code=500, detail=f"گرفتن اسکرین‌شات برای {symbol} پس از {max_retries} تلاش ناموفق بود: {str(e)}")
-                    await asyncio.sleep(3)
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(3)
                 finally:
-                    try:
-                        await close_playwright_resources(context, None)
-                    except Exception as e:
-                        logger.error(f"خطا در بستن منابع برای {symbol}: {str(e)}")
-                        consecutive_errors += 1
-                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                            logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
-                            sys.exit(1)
-        finally:
-            try:
-                await close_playwright_resources(None, browser)
-                memory_info = psutil.virtual_memory()
-                logger.info(f"مصرف حافظه پس از پردازش {symbol}: {memory_info.percent}% (در دسترس: {memory_info.available / 1024 / 1024:.2f} MB)")
-            except Exception as e:
-                logger.error(f"خطا در بستن مرورگر برای {symbol}: {str(e)}")
-                consecutive_errors += 1
-                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                    logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
-                    sys.exit(1)
+                    await close_playwright_resources(context, None)
+    except Exception as e:
+        logger.error(f"خطای بحرانی در پردازش {symbol}: {str(e)}")
+        consecutive_errors += 1
+        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
+            sys.exit(1)
+        raise HTTPException(status_code=500, detail=f"گرفتن اسکرین‌شات برای {symbol} ناموفق بود: {str(e)}")
+    finally:
+        await close_playwright_resources(None, browser)
+        memory_info = psutil.virtual_memory()
+        logger.info(f"مصرف حافظه پس از پردازش {symbol}: {memory_info.percent}% (در دسترس: {memory_info.available / 1024 / 1024:.2f} MB)")
 
 def add_arrow_to_image(image_path: str, signal_type: str) -> str:
     try:
