@@ -10,6 +10,7 @@ import asyncio
 import psutil
 import sys
 import uuid
+import tempfile  # برای path موقتی امن‌تر
 
 # تنظیمات لاگ
 logging.basicConfig(
@@ -64,11 +65,13 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     if exchange.upper() not in SUPPORTED_EXCHANGES:
         raise HTTPException(status_code=400, detail=f"صرافی {exchange} پشتیبانی نمی‌شود. صرافی‌های موجود: {', '.join(SUPPORTED_EXCHANGES)}")
     
-    output_path = f"/tmp/{symbol}_screenshot_{uuid.uuid4().hex}.png"
-    debug_path = f"/tmp/{symbol}_debug_screenshot_{uuid.uuid4().hex}.png"
+    # استفاده از tempfile برای path امن‌تر (به جای /tmp مستقیم)
+    temp_dir = tempfile.gettempdir()
+    output_path = os.path.join(temp_dir, f"{symbol}_screenshot_{uuid.uuid4().hex}.png")
+    debug_path = os.path.join(temp_dir, f"{symbol}_debug_screenshot_{uuid.uuid4().hex}.png")
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
     
-    max_retries = 3
+    max_retries = 5  # افزایش retry برای cold start Render.com
     browser = None
     try:
         async with async_playwright() as p:
@@ -98,16 +101,27 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         page = await context.new_page()
                         
                         logger.info(f"رفتن به {chart_url} برای {symbol} (تلاش {attempt + 1})")
-                        await page.goto(chart_url, timeout=60000, wait_until="networkidle")
+                        await page.goto(chart_url, timeout=90000, wait_until="networkidle")  # timeout به 90 ثانیه
                         logger.info(f"صفحه برای {symbol} بارگذاری شد")
                         
                         # انتظار برای رندر کامل صفحه
-                        await page.wait_for_load_state("networkidle", timeout=60000)
+                        await page.wait_for_load_state("networkidle", timeout=90000)
+                        await asyncio.sleep(5)  # صبر اضافی برای لود کامل TradingView
                         
-                        await page.screenshot(path=output_path, full_page=True, timeout=60000)
-                        logger.info(f"اسکرین‌شات برای {symbol} ذخیره شد: {output_path}")
-                        consecutive_errors = 0
-                        return output_path
+                        await page.screenshot(path=output_path, full_page=True, timeout=90000)
+                        logger.info(f"اسکرین‌شات اولیه برای {symbol} ذخیره شد: {output_path}")
+                        
+                        # چک وجود و سایز فایل بعد از screenshot (کلید fix intermittent issue)
+                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # حداقل 1KB برای معتبر بودن
+                            logger.info(f"فایل screenshot معتبر است: {output_path} (سایز: {os.path.getsize(output_path)} bytes)")
+                            consecutive_errors = 0
+                            return output_path
+                        else:
+                            logger.warning(f"فایل screenshot نامعتبر یا خالی: {output_path} (سایز: {os.path.getsize(output_path) if os.path.exists(output_path) else 0} bytes)")
+                            if os.path.exists(output_path):
+                                os.remove(output_path)
+                            raise ValueError(f"Screenshot file invalid: too small or missing")
+                        
                 except Exception as e:
                     logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
                     consecutive_errors += 1
@@ -116,7 +130,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         sys.exit(1)
                     
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(10)  # صبر بیشتر بین retryها (برای cold start)
                 finally:
                     await close_playwright_resources(context, None)
     except Exception as e:
@@ -132,7 +146,12 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
         logger.info(f"مصرف حافظه پس از پردازش {symbol}: {memory_info.percent}% (در دسترس: {memory_info.available / 1024 / 1024:.2f} MB)")
 
 def add_arrow_to_image(image_path: str, signal_type: str) -> str:
+    # چک اولیه وجود فایل
+    if not image_path or not os.path.exists(image_path):
+        raise ValueError(f"Image file does not exist or is None: {image_path}")
+    
     try:
+        logger.info(f"پردازش تصویر: {image_path} (سایز: {os.path.getsize(image_path)} bytes)")
         img = Image.open(image_path).convert('RGBA')
         draw = ImageDraw.Draw(img)
         
@@ -143,7 +162,13 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
             logger.warning("فونت LiberationSans-Regular.ttf یافت نشد، استفاده از فونت پیش‌فرض")
         
         signal_text = "BUY" if signal_type == "خرید" else "SELL"
-        text_width = draw.textlength(signal_text, font=font)
+        # fallback برای textlength (سازگاری با نسخه‌های مختلف PIL)
+        try:
+            text_width = draw.textlength(signal_text, font=font)
+        except AttributeError:
+            bbox = draw.textbbox((0, 0), signal_text, font=font)
+            text_width = bbox[2] - bbox[0]
+        
         padding = 10
         box_width = text_width + 2 * padding
         box_height = 50 + 2 * padding
@@ -182,6 +207,7 @@ async def screenshot_ping(api_key: str = Security(verify_api_key)):
 
 @app.post("/screenshot", response_model=dict)
 async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(verify_api_key)):
+    image_path = None
     try:
         image_path = await take_screenshot(
             symbol=request.symbol,
@@ -189,18 +215,35 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
             exchange=request.exchange
         )
         
+        # چک نهایی قبل از پردازش
+        if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
+            raise ValueError(f"Screenshot file invalid after creation: {image_path}")
+        
         image_path = add_arrow_to_image(image_path, request.signal)
+        
+        # چک نهایی بعد از پردازش
+        if not os.path.exists(image_path):
+            raise ValueError("Processed image file does not exist")
         
         with open(image_path, "rb") as f:
             image_data = f.read()
         
-        try:
-            os.unlink(image_path)
-            logger.info(f"فایل اسکرین‌شات {image_path} حذف شد")
-        except Exception as e:
-            logger.warning(f"خطا در حذف فایل اسکرین‌شات {image_path}: {str(e)}")
+        if not image_data:
+            raise ValueError("Image data is empty")
         
+        logger.info(f"اسکرین‌شات کامل برای {request.symbol} ارسال شد")
         return {"image": image_data.hex()}
+    except ValueError as ve:
+        logger.error(f"ValueError در اسکرین‌شات: {str(ve)}")
+        raise HTTPException(status_code=500, detail=str(ve))
     except Exception as e:
         logger.error(f"خطا در پردازش درخواست اسکرین‌شات برای {request.symbol}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # cleanup در finally برای جلوگیری از leak
+        if image_path and os.path.exists(image_path):
+            try:
+                os.unlink(image_path)
+                logger.info(f"فایل اسکرین‌شات {image_path} حذف شد")
+            except Exception as e:
+                logger.warning(f"خطا در حذف فایل اسکرین‌شات {image_path}: {str(e)}")
