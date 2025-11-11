@@ -68,10 +68,9 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     # استفاده از tempfile برای path امن‌تر (به جای /tmp مستقیم)
     temp_dir = tempfile.gettempdir()
     output_path = os.path.join(temp_dir, f"{symbol}_screenshot_{uuid.uuid4().hex}.png")
-    debug_path = os.path.join(temp_dir, f"{symbol}_debug_screenshot_{uuid.uuid4().hex}.png")
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
     
-    max_retries = 5  # افزایش retry برای cold start Render.com
+    max_retries = 7  # افزایش retry برای cold start و flaky loads
     browser = None
     try:
         async with async_playwright() as p:
@@ -85,6 +84,9 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                     '--single-process',
                     '--disable-background-networking',
                     '--disable-background-timer-throttling',
+                    '--disable-extensions',  # اضافی برای سرعت
+                    '--disable-plugins',
+                    '--no-first-run',
                 ]
             )
             for attempt in range(max_retries):
@@ -92,35 +94,62 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                 try:
                     async with semaphore:
                         memory_info = psutil.virtual_memory()
-                        logger.info(f"مصرف حافظه قبل از پردازش {symbol}: {memory_info.percent}% (در دسترس: {memory_info.available / 1024 / 1024:.2f} MB، سماфор گرفته شد)")
+                        logger.info(f"مصرف حافظه قبل از پردازش {symbol}: {memory_info.percent}% (در دسترس: {memory_info.available / 1024 / 1024:.2f} MB، سماфор گرفته شد، تلاش {attempt + 1})")
                         
                         context = await browser.new_context(
                             viewport={'width': 1280, 'height': 720},
-                            no_viewport=True
+                            no_viewport=True,
+                            # Script برای disable font loading موقت (fix hang)
+                            java_script_enabled=True
                         )
+                        
+                        # Init script برای skip fonts و animations (TradingView fix)
+                        await context.add_init_script("""
+                            // Disable font loading to prevent hang
+                            window.__playwright_disable_fonts = true;
+                            // Skip animations
+                            document.addEventListener('DOMContentLoaded', () => {
+                                const style = document.createElement('style');
+                                style.textContent = '* { animation: none !important; transition: none !important; }';
+                                document.head.appendChild(style);
+                            });
+                        """)
+                        
                         page = await context.new_page()
                         
-                        logger.info(f"رفتن به {chart_url} برای {symbol} (تلاش {attempt + 1})")
-                        await page.goto(chart_url, timeout=90000, wait_until="networkidle")  # timeout به 90 ثانیه
-                        logger.info(f"صفحه برای {symbol} بارگذاری شد")
+                        logger.info(f"رفتن به {chart_url} برای {symbol}")
+                        await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")  # تغییر به domcontentloaded + manual wait
+                        logger.info(f"صفحه برای {symbol} بارگذاری اولیه شد")
                         
-                        # انتظار برای رندر کامل صفحه
-                        await page.wait_for_load_state("networkidle", timeout=90000)
-                        await asyncio.sleep(5)  # صبر اضافی برای لود کامل TradingView
+                        # Wait for TradingView-specific chart elements (fix incomplete render)
+                        try:
+                            await page.wait_for_selector(".chart-container, [data-name='legend-source'], .tv-chart-view__chart-container", timeout=60000)
+                            logger.info(f"Chart elements لود شد برای {symbol}")
+                        except Exception as wait_e:
+                            logger.warning(f"Selector wait failed: {wait_e} - continuing anyway")
                         
-                        await page.screenshot(path=output_path, full_page=True, timeout=90000)
+                        # Wait for network idle + extra sleep for fonts/animations
+                        await page.wait_for_load_state("networkidle", timeout=60000)
+                        await asyncio.sleep(10)  # صبر اضافی برای TradingView render کامل
+                        
+                        await page.screenshot(path=output_path, full_page=True, timeout=120000)
                         logger.info(f"اسکرین‌شات اولیه برای {symbol} ذخیره شد: {output_path}")
                         
-                        # چک وجود و سایز فایل بعد از screenshot (کلید fix intermittent issue)
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:  # حداقل 1KB برای معتبر بودن
-                            logger.info(f"فایل screenshot معتبر است: {output_path} (سایز: {os.path.getsize(output_path)} bytes)")
+                        # خواندن bytes و چک طول (به جای فقط سایز فایل)
+                        with open(output_path, 'rb') as f:
+                            image_bytes = f.read()
+                        logger.info(f"طول bytes screenshot: {len(image_bytes)} (اگر <10KB، invalid)")
+                        
+                        # چک معتبر بودن (حداقل 10KB برای TradingView full page)
+                        if len(image_bytes) > 10000:
+                            logger.info(f"فایل screenshot معتبر است: {output_path} (طول: {len(image_bytes)} bytes)")
                             consecutive_errors = 0
                             return output_path
                         else:
-                            logger.warning(f"فایل screenshot نامعتبر یا خالی: {output_path} (سایز: {os.path.getsize(output_path) if os.path.exists(output_path) else 0} bytes)")
+                            logger.warning(f"فایل screenshot نامعتبر یا خالی: {output_path} (طول: {len(image_bytes)} bytes)")
                             if os.path.exists(output_path):
                                 os.remove(output_path)
-                            raise ValueError(f"Screenshot file invalid: too small or missing")
+                            raise ValueError(f"Screenshot too small: {len(image_bytes)} bytes")
                         
                 except Exception as e:
                     logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
@@ -130,7 +159,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         sys.exit(1)
                     
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(10)  # صبر بیشتر بین retryها (برای cold start)
+                        await asyncio.sleep(2 ** attempt + 5)  # Backoff exponential (5s, 7s, 13s, etc.)
                 finally:
                     await close_playwright_resources(context, None)
     except Exception as e:
@@ -152,6 +181,11 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
     
     try:
         logger.info(f"پردازش تصویر: {image_path} (سایز: {os.path.getsize(image_path)} bytes)")
+        with open(image_path, 'rb') as f:
+            img_bytes = f.read()
+        if len(img_bytes) < 10000:
+            raise ValueError(f"Image too small before PIL: {len(img_bytes)} bytes")
+        
         img = Image.open(image_path).convert('RGBA')
         draw = ImageDraw.Draw(img)
         
@@ -231,7 +265,7 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
         if not image_data:
             raise ValueError("Image data is empty")
         
-        logger.info(f"اسکرین‌شات کامل برای {request.symbol} ارسال شد")
+        logger.info(f"اسکرین‌شات کامل برای {request.symbol} ارسال شد (طول: {len(image_data)} bytes)")
         return {"image": image_data.hex()}
     except ValueError as ve:
         logger.error(f"ValueError در اسکرین‌شات: {str(ve)}")
