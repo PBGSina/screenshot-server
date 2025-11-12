@@ -10,7 +10,7 @@ import asyncio
 import psutil
 import sys
 import uuid
-import tempfile  # برای path موقتی امن‌تر
+import tempfile
 
 # تنظیمات لاگ
 logging.basicConfig(
@@ -32,7 +32,7 @@ semaphore = asyncio.Semaphore(2)
 
 # شمارش خطاهای متوالی
 consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 5  # حداکثر خطاهای متوالی قبل از ری‌استارت
+MAX_CONSECUTIVE_ERRORS = 5
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -65,12 +65,11 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     if exchange.upper() not in SUPPORTED_EXCHANGES:
         raise HTTPException(status_code=400, detail=f"صرافی {exchange} پشتیبانی نمی‌شود. صرافی‌های موجود: {', '.join(SUPPORTED_EXCHANGES)}")
     
-    # استفاده از tempfile برای path امن‌تر (به جای /tmp مستقیم)
     temp_dir = tempfile.gettempdir()
     output_path = os.path.join(temp_dir, f"{symbol}_screenshot_{uuid.uuid4().hex}.png")
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
     
-    max_retries = 7  # افزایش retry برای cold start و flaky loads
+    max_retries = 8  # افزایش برای flaky symbols
     browser = None
     try:
         async with async_playwright() as p:
@@ -84,7 +83,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                     '--single-process',
                     '--disable-background-networking',
                     '--disable-background-timer-throttling',
-                    '--disable-extensions',  # اضافی برای سرعت
+                    '--disable-extensions',
                     '--disable-plugins',
                     '--no-first-run',
                 ]
@@ -99,57 +98,79 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         context = await browser.new_context(
                             viewport={'width': 1280, 'height': 720},
                             no_viewport=True,
-                            # Script برای disable font loading موقت (fix hang)
-                            java_script_enabled=True
+                            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"  # Real Chrome UA برای bypass detection
                         )
                         
-                        # Init script برای skip fonts و animations (TradingView fix)
+                        # Init script برای disable fonts/animations + force chart load
                         await context.add_init_script("""
-                            // Disable font loading to prevent hang
+                            // Disable heavy loads
                             window.__playwright_disable_fonts = true;
-                            // Skip animations
                             document.addEventListener('DOMContentLoaded', () => {
                                 const style = document.createElement('style');
                                 style.textContent = '* { animation: none !important; transition: none !important; }';
                                 document.head.appendChild(style);
                             });
+                            // Force TradingView chart init (if available)
+                            if (window.TradingView) {
+                                TradingView.onready(() => {
+                                    console.log('TradingView ready');
+                                });
+                            }
                         """)
                         
                         page = await context.new_page()
                         
                         logger.info(f"رفتن به {chart_url} برای {symbol}")
-                        await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")  # تغییر به domcontentloaded + manual wait
+                        await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")
                         logger.info(f"صفحه برای {symbol} بارگذاری اولیه شد")
                         
-                        # Wait for TradingView-specific chart elements (fix incomplete render)
+                        # Optional selector wait با timeout کمتر (جدید: selectors بروز)
+                        selector_success = False
                         try:
-                            await page.wait_for_selector(".chart-container, [data-name='legend-source'], .tv-chart-view__chart-container", timeout=60000)
-                            logger.info(f"Chart elements لود شد برای {symbol}")
+                            await page.wait_for_selector(".chart-container, .tv-chart-container, .pane-legend, .tv-chart-view__chart-container", timeout=30000)  # 30s
+                            selector_success = True
+                            logger.info(f"Chart selectors لود شد برای {symbol}")
                         except Exception as wait_e:
-                            logger.warning(f"Selector wait failed: {wait_e} - continuing anyway")
+                            logger.warning(f"Selector wait failed for {symbol}: {wait_e} - continuing without selector check")
                         
-                        # Wait for network idle + extra sleep for fonts/animations
-                        await page.wait_for_load_state("networkidle", timeout=60000)
-                        await asyncio.sleep(10)  # صبر اضافی برای TradingView render کامل
+                        # تغییر به "load" + sleep طولانی (fix networkidle hang)
+                        await page.wait_for_load_state("load", timeout=60000)
+                        await asyncio.sleep(15)  # Sleep ثابت 15s برای render کامل (حتی بدون selector)
+                        
+                        # Force chart trigger با JS eval (fix incomplete load)
+                        try:
+                            await page.evaluate("""
+                                // Trigger chart resize/load if TradingView API available
+                                if (window.TradingView && window.TradingView.widget) {
+                                    window.TradingView.widget.chart().timeScale().fitContent();
+                                    console.log('Chart forced to load');
+                                } else {
+                                    // Fallback: resize window to trigger
+                                    window.dispatchEvent(new Event('resize'));
+                                }
+                            """)
+                            logger.info(f"JS force load executed for {symbol}")
+                            await asyncio.sleep(5)  # Extra sleep بعد از eval
+                        except Exception as js_e:
+                            logger.warning(f"JS eval failed for {symbol}: {js_e} - continuing")
                         
                         await page.screenshot(path=output_path, full_page=True, timeout=120000)
                         logger.info(f"اسکرین‌شات اولیه برای {symbol} ذخیره شد: {output_path}")
                         
-                        # خواندن bytes و چک طول (به جای فقط سایز فایل)
+                        # خواندن و چک bytes
                         with open(output_path, 'rb') as f:
                             image_bytes = f.read()
-                        logger.info(f"طول bytes screenshot: {len(image_bytes)} (اگر <10KB، invalid)")
+                        logger.info(f"طول bytes screenshot برای {symbol}: {len(image_bytes)} (اگر <50KB، invalid)")
                         
-                        # چک معتبر بودن (حداقل 10KB برای TradingView full page)
-                        if len(image_bytes) > 10000:
+                        if len(image_bytes) > 50000:  # سخت‌گیرانه‌تر: حداقل 50KB برای full chart
                             logger.info(f"فایل screenshot معتبر است: {output_path} (طول: {len(image_bytes)} bytes)")
                             consecutive_errors = 0
                             return output_path
                         else:
-                            logger.warning(f"فایل screenshot نامعتبر یا خالی: {output_path} (طول: {len(image_bytes)} bytes)")
+                            logger.warning(f"فایل screenshot نامعتبر یا کوچک برای {symbol}: {output_path} (طول: {len(image_bytes)} bytes)")
                             if os.path.exists(output_path):
                                 os.remove(output_path)
-                            raise ValueError(f"Screenshot too small: {len(image_bytes)} bytes")
+                            raise ValueError(f"Screenshot too small: {len(image_bytes)} bytes - retrying")
                         
                 except Exception as e:
                     logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
@@ -159,7 +180,9 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         sys.exit(1)
                     
                     if attempt < max_retries - 1:
-                        await asyncio.sleep(2 ** attempt + 5)  # Backoff exponential (5s, 7s, 13s, etc.)
+                        sleep_time = min(2 ** attempt + 10, 30)  # Backoff: 12s, 14s, ..., max 30s
+                        logger.info(f"صبر {sleep_time}s قبل از retry {attempt + 2}")
+                        await asyncio.sleep(sleep_time)
                 finally:
                     await close_playwright_resources(context, None)
     except Exception as e:
@@ -175,7 +198,6 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
         logger.info(f"مصرف حافظه پس از پردازش {symbol}: {memory_info.percent}% (در دسترس: {memory_info.available / 1024 / 1024:.2f} MB)")
 
 def add_arrow_to_image(image_path: str, signal_type: str) -> str:
-    # چک اولیه وجود فایل
     if not image_path or not os.path.exists(image_path):
         raise ValueError(f"Image file does not exist or is None: {image_path}")
     
@@ -183,7 +205,7 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
         logger.info(f"پردازش تصویر: {image_path} (سایز: {os.path.getsize(image_path)} bytes)")
         with open(image_path, 'rb') as f:
             img_bytes = f.read()
-        if len(img_bytes) < 10000:
+        if len(img_bytes) < 50000:
             raise ValueError(f"Image too small before PIL: {len(img_bytes)} bytes")
         
         img = Image.open(image_path).convert('RGBA')
@@ -196,7 +218,6 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
             logger.warning("فونت LiberationSans-Regular.ttf یافت نشد، استفاده از فونت پیش‌فرض")
         
         signal_text = "BUY" if signal_type == "خرید" else "SELL"
-        # fallback برای textlength (سازگاری با نسخه‌های مختلف PIL)
         try:
             text_width = draw.textlength(signal_text, font=font)
         except AttributeError:
@@ -229,13 +250,11 @@ def add_arrow_to_image(image_path: str, signal_type: str) -> str:
 
 @app.get("/ping")
 async def ping(api_key: str = Security(verify_api_key)):
-    """اندپوینت برای پینگ کردن سرور"""
     logger.info(f"درخواست پینگ دریافت شد - {datetime.utcnow()}")
     return {"status": "alive"}
 
 @app.get("/screenshot/ping")
 async def screenshot_ping(api_key: str = Security(verify_api_key)):
-    """اندپوینت برای پینگ کردن سرور (برای سازگاری با /screenshot/ping)"""
     logger.info(f"درخواست پینگ اسکرین‌شات دریافت شد - {datetime.utcnow()}")
     return {"status": "alive"}
 
@@ -249,13 +268,11 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
             exchange=request.exchange
         )
         
-        # چک نهایی قبل از پردازش
         if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
             raise ValueError(f"Screenshot file invalid after creation: {image_path}")
         
         image_path = add_arrow_to_image(image_path, request.signal)
         
-        # چک نهایی بعد از پردازش
         if not os.path.exists(image_path):
             raise ValueError("Processed image file does not exist")
         
@@ -274,7 +291,6 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
         logger.error(f"خطا در پردازش درخواست اسکرین‌شات برای {request.symbol}: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        # cleanup در finally برای جلوگیری از leak
         if image_path and os.path.exists(image_path):
             try:
                 os.unlink(image_path)
