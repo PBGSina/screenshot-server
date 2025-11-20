@@ -32,7 +32,7 @@ semaphore = asyncio.Semaphore(2)
 
 # شمارش خطاهای متوالی
 consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 5
+MAX_CONSECUTIVE_ERRORS = 15
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -177,7 +177,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                     consecutive_errors += 1
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                         logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
-                        sys.exit(1)
+                        consecutive_errors = 0
                     
                     if attempt < max_retries - 1:
                         sleep_time = min(2 ** attempt + 10, 30)  # Backoff: 12s, 14s, ..., max 30s
