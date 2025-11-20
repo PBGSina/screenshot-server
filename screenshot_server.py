@@ -8,7 +8,6 @@ import logging
 from datetime import datetime
 import asyncio
 import psutil
-import sys
 import uuid
 import tempfile
 
@@ -32,7 +31,7 @@ semaphore = asyncio.Semaphore(2)
 
 # شمارش خطاهای متوالی
 consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 5
+MAX_CONSECUTIVE_ERRORS = 15
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -69,7 +68,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     output_path = os.path.join(temp_dir, f"{symbol}_screenshot_{uuid.uuid4().hex}.png")
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
     
-    max_retries = 8  # افزایش برای flaky symbols
+    max_retries = 3  # کاهش برای جلوگیری از پر شدن errors
     browser = None
     try:
         async with async_playwright() as p:
@@ -134,14 +133,18 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                         await asyncio.sleep(2)  # صبر اضافی برای لود کامل
                         
                         # اجرای JS برای force load
-                        await page.evaluate("""
-                            () => {
-                                if (window.TradingView) {
-                                    TradingView.onChartReady(() => console.log('Chart ready'));
+                        try:
+                            await page.evaluate("""
+                                () => {
+                                    if (window.TradingView) {
+                                        TradingView.onChartReady(() => console.log('Chart ready'));
+                                    }
                                 }
-                            }
-                        """)
-                        logger.info(f"JS force load executed for {symbol}")
+                            """)
+                            logger.info(f"JS force load executed for {symbol}")
+                        except Exception as js_e:
+                            logger.warning(f"JS execute failed for {symbol}: {str(js_e)} - skipping")
+                        
                         await asyncio.sleep(10)  # صبر اضافی برای رندر کامل
                         
                         await page.screenshot(path=output_path, full_page=True)
@@ -167,8 +170,8 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                     logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
                     await close_playwright_resources(context, browser)
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                        logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
-                        sys.exit(1)
+                        logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ریست consecutive_errors...")
+                        consecutive_errors = 0  # ریست به جای kill سرور
                     await asyncio.sleep(5)
                     
         logger.error(f"گرفتن اسکرین‌شات برای {symbol} پس از {max_retries} تلاش ناموفق بود")
