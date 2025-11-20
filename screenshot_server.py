@@ -31,7 +31,7 @@ semaphore = asyncio.Semaphore(2)
 
 # شمارش خطاهای متوالی
 consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 15
+MAX_CONSECUTIVE_ERRORS = 5
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -68,7 +68,7 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     output_path = os.path.join(temp_dir, f"{symbol}_screenshot_{uuid.uuid4().hex}.png")
     chart_url = f"https://www.tradingview.com/chart/?symbol={exchange}:{symbol}&interval={interval}&theme=dark"
     
-    max_retries = 3  # کاهش برای جلوگیری از پر شدن errors
+    max_retries = 8  # افزایش برای flaky symbols
     browser = None
     try:
         async with async_playwright() as p:
@@ -253,13 +253,10 @@ async def get_screenshot(request: ScreenshotRequest, api_key: str = Security(ver
             exchange=request.exchange
         )
         
-        if not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
-            raise ValueError(f"Screenshot file invalid after creation: {image_path}")
-        
-        image_path = add_arrow_to_image(image_path, request.signal)
-        
         if not os.path.exists(image_path):
             raise ValueError("Processed image file does not exist")
+        
+        image_path = add_arrow_to_image(image_path, request.signal)
         
         with open(image_path, "rb") as f:
             image_data = f.read()
