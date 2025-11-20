@@ -32,7 +32,7 @@ semaphore = asyncio.Semaphore(2)
 
 # شمارش خطاهای متوالی
 consecutive_errors = 0
-MAX_CONSECUTIVE_ERRORS = 15
+MAX_CONSECUTIVE_ERRORS = 5
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
@@ -63,7 +63,7 @@ async def close_playwright_resources(context=None, browser=None):
 async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
     global consecutive_errors
     if exchange.upper() not in SUPPORTED_EXCHANGES:
-        raise HTTPException(status_code=400, detail=f"صرافی {exchange} پشتیبانی نمی‌شود. صرافی‌های موجود: {', '.join(SUPPORTED_EXCHANGES)}")
+        raise HTTPException(status_code=400, detail=f"صرافی {exchange} پشتیبانی نمی‌شود. صرافی‌های موجود: {', '.join(SUPPORTED_EXCHANGES)}. صرافی‌های موجود: {', '.join(SUPPORTED_EXCHANGES)}")
     
     temp_dir = tempfile.gettempdir()
     output_path = os.path.join(temp_dir, f"{symbol}_screenshot_{uuid.uuid4().hex}.png")
@@ -112,86 +112,68 @@ async def take_screenshot(symbol: str, interval: str, exchange: str) -> str:
                             });
                             // Force TradingView chart init (if available)
                             if (window.TradingView) {
-                                TradingView.onready(() => {
-                                    console.log('TradingView ready');
-                                });
+                                TradingView.onready(() => console.log('Chart ready'));
                             }
                         """)
                         
                         page = await context.new_page()
                         
                         logger.info(f"رفتن به {chart_url} برای {symbol}")
-                        await page.goto(chart_url, timeout=120000, wait_until="domcontentloaded")
-                        logger.info(f"صفحه برای {symbol} بارگذاری اولیه شد")
+                        await page.goto(chart_url, timeout=60000)
                         
-                        # Optional selector wait با timeout کمتر (جدید: selectors بروز)
-                        selector_success = False
                         try:
-                            await page.wait_for_selector(".chart-container, .tv-chart-container, .pane-legend, .tv-chart-view__chart-container", timeout=30000)  # 30s
-                            selector_success = True
+                            await page.wait_for_selector(
+                                ".chart-container, .tv-chart-container, .pane-legend, .tv-chart-view__chart-container",
+                                timeout=45000  # افزایش به 45 ثانیه
+                            )
                             logger.info(f"Chart selectors لود شد برای {symbol}")
-                        except Exception as wait_e:
-                            logger.warning(f"Selector wait failed for {symbol}: {wait_e} - continuing without selector check")
+                        except Exception as e:
+                            logger.warning(f"Selector wait failed for {symbol}: {str(e)} - ادامه با sleep اضافی")
+                            await asyncio.sleep(15)  # 15 ثانیه اضافی صبر کن
                         
-                        # تغییر به "load" + sleep طولانی (fix networkidle hang)
-                        await page.wait_for_load_state("load", timeout=60000)
-                        await asyncio.sleep(15)  # Sleep ثابت 15s برای render کامل (حتی بدون selector)
+                        await asyncio.sleep(2)  # صبر اضافی برای لود کامل
                         
-                        # Force chart trigger با JS eval (fix incomplete load)
-                        try:
-                            await page.evaluate("""
-                                // Trigger chart resize/load if TradingView API available
-                                if (window.TradingView && window.TradingView.widget) {
-                                    window.TradingView.widget.chart().timeScale().fitContent();
-                                    console.log('Chart forced to load');
-                                } else {
-                                    // Fallback: resize window to trigger
-                                    window.dispatchEvent(new Event('resize'));
+                        # اجرای JS برای force load
+                        await page.evaluate("""
+                            () => {
+                                if (window.TradingView) {
+                                    TradingView.onChartReady(() => console.log('Chart ready'));
                                 }
-                            """)
-                            logger.info(f"JS force load executed for {symbol}")
-                            await asyncio.sleep(5)  # Extra sleep بعد از eval
-                        except Exception as js_e:
-                            logger.warning(f"JS eval failed for {symbol}: {js_e} - continuing")
+                            }
+                        """)
+                        logger.info(f"JS force load executed for {symbol}")
+                        await asyncio.sleep(10)  # صبر اضافی برای رندر کامل
                         
-                        await page.screenshot(path=output_path, full_page=True, timeout=120000)
+                        await page.screenshot(path=output_path, full_page=True)
                         logger.info(f"اسکرین‌شات اولیه برای {symbol} ذخیره شد: {output_path}")
                         
-                        # خواندن و چک bytes
                         with open(output_path, 'rb') as f:
-                            image_bytes = f.read()
-                        logger.info(f"طول bytes screenshot برای {symbol}: {len(image_bytes)} (اگر <50KB، invalid)")
+                            img_bytes = f.read()
+                        logger.info(f"طول bytes screenshot برای {symbol}: {len(img_bytes)} (اگر <50KB، invalid)")
                         
-                        if len(image_bytes) > 50000:  # سخت‌گیرانه‌تر: حداقل 50KB برای full chart
-                            logger.info(f"فایل screenshot معتبر است: {output_path} (طول: {len(image_bytes)} bytes)")
-                            consecutive_errors = 0
-                            return output_path
-                        else:
-                            logger.warning(f"فایل screenshot نامعتبر یا کوچک برای {symbol}: {output_path} (طول: {len(image_bytes)} bytes)")
-                            if os.path.exists(output_path):
-                                os.remove(output_path)
-                            raise ValueError(f"Screenshot too small: {len(image_bytes)} bytes - retrying")
+                        if len(img_bytes) < 50000:
+                            logger.warning(f"اسکرین‌شات برای {symbol} ممکن است نامعتبر باشد (طول: {len(img_bytes)} bytes)، تلاش مجدد")
+                            consecutive_errors += 1
+                            await close_playwright_resources(context, browser)
+                            await asyncio.sleep(5)
+                            continue
+                        
+                        logger.info(f"فایل screenshot معتبر است: {output_path} (طول: {len(img_bytes)} bytes)")
+                        consecutive_errors = 0
+                        return output_path
                         
                 except Exception as e:
-                    logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
                     consecutive_errors += 1
+                    logger.error(f"تلاش {attempt + 1} برای اسکرین‌شات {symbol} ناموفق: {str(e)}")
+                    await close_playwright_resources(context, browser)
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                         logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
-                        consecutive_errors = 0
+                        sys.exit(1)
+                    await asyncio.sleep(5)
                     
-                    if attempt < max_retries - 1:
-                        sleep_time = min(2 ** attempt + 10, 30)  # Backoff: 12s, 14s, ..., max 30s
-                        logger.info(f"صبر {sleep_time}s قبل از retry {attempt + 2}")
-                        await asyncio.sleep(sleep_time)
-                finally:
-                    await close_playwright_resources(context, None)
-    except Exception as e:
-        logger.error(f"خطای بحرانی در پردازش {symbol}: {str(e)}")
+        logger.error(f"گرفتن اسکرین‌شات برای {symbol} پس از {max_retries} تلاش ناموفق بود")
         consecutive_errors += 1
-        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-            logger.error(f"تعداد خطاهای متوالی به {consecutive_errors} رسید. ری‌استارت سرور...")
-            sys.exit(1)
-        raise HTTPException(status_code=500, detail=f"گرفتن اسکرین‌شات برای {symbol} ناموفق بود: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to take screenshot after max retries")
     finally:
         await close_playwright_resources(None, browser)
         memory_info = psutil.virtual_memory()
